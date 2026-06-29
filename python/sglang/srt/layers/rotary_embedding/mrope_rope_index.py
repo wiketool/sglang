@@ -70,6 +70,18 @@ def get_rope_index(
             second_per_grid_ts,
             **kwargs,
         )
+    if model_type in ("KeyeVL2", "KeyeVL2Moe", "KeyeVL1_5"):
+        return get_rope_index_keye(
+            spatial_merge_size,
+            image_token_id,
+            video_token_id,
+            vision_start_token_id,
+            model_type,
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            kwargs.get("attention_mask"),
+        )
     if (
         model_type.startswith("qwen3_vl")
         or model_type.startswith("qwen3_vl_moe")
