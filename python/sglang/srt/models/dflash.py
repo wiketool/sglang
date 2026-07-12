@@ -27,9 +27,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
+    DFLASH_NEXT_TOKEN_LAYOUT,
+    DFLASH_SAME_POSITION_LAYOUT,
     can_dflash_slice_qkv_weight,
+    expected_dflash_core_weight_names,
     parse_dflash_draft_config,
 )
+from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +94,9 @@ class DFlashAttention(nn.Module):
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
-        rope_theta = float(getattr(config, "rope_theta", 1000000))
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
+        rope_theta = float(rope_theta)
+        self.rope_theta = rope_theta
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
@@ -257,6 +262,9 @@ class DFlashDraftModel(nn.Module):
       - `norm.weight` for final normalization
     """
 
+    dflash_layout_name = DFLASH_SAME_POSITION_LAYOUT
+    strict_weight_coverage = False
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
         self.config = config
@@ -291,6 +299,13 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+
+        if draft_config.layout.name != self.dflash_layout_name:
+            raise ValueError(
+                "DFLASH config/model layout mismatch: "
+                f"architecture layout={draft_config.layout.name!r}, "
+                f"model capability={self.dflash_layout_name!r}."
+            )
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
@@ -350,6 +365,12 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        loaded_params = set()
+        consumed_checkpoint_weights = set()
+        unexpected_checkpoint_weights = set()
+
+        def canonical_checkpoint_name(name: str) -> str:
+            return name[len("model.") :] if name.startswith("model.") else name
 
         def resolve_param_name(name: str) -> Optional[str]:
             if name in params_dict:
@@ -365,6 +386,7 @@ class DFlashDraftModel(nn.Module):
             return None
 
         for name, loaded_weight in weights:
+            checkpoint_name = name
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
@@ -375,11 +397,20 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(resolved_name)
+                consumed_checkpoint_weights.add(
+                    canonical_checkpoint_name(checkpoint_name)
+                )
                 break
             else:
                 resolved_name = resolve_param_name(name)
                 if resolved_name is None:
-                    # Ignore unexpected weights (e.g., HF rotary caches).
+                    canonical_name = canonical_checkpoint_name(checkpoint_name)
+                    if canonical_name not in {
+                        "embed_tokens.weight",
+                        "lm_head.weight",
+                    }:
+                        unexpected_checkpoint_weights.add(canonical_name)
                     continue
                 param = params_dict[resolved_name]
                 if resolved_name.endswith("fc.weight") and tuple(
@@ -394,6 +425,31 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded_params.add(resolved_name)
+                consumed_checkpoint_weights.add(
+                    canonical_checkpoint_name(checkpoint_name)
+                )
+
+        if self.strict_weight_coverage:
+            expected_checkpoint_weights = expected_dflash_core_weight_names(
+                len(self.layers)
+            )
+            missing = expected_checkpoint_weights - consumed_checkpoint_weights
+            if missing or unexpected_checkpoint_weights:
+                raise ValueError(
+                    "Qwen3DSparkModel checkpoint weight coverage failed: "
+                    f"missing_core={sorted(missing)}, "
+                    f"unexpected={sorted(unexpected_checkpoint_weights)}. "
+                    "Only embed_tokens.weight and lm_head.weight may be ignored."
+                )
+        return loaded_params
 
 
-EntryClass = DFlashDraftModel
+class Qwen3DSparkModel(DFlashDraftModel):
+    """DeepSpec Qwen3 DFlash checkpoint with next-token-aligned outputs."""
+
+    dflash_layout_name = DFLASH_NEXT_TOKEN_LAYOUT
+    strict_weight_coverage = True
+
+
+EntryClass = [DFlashDraftModel, Qwen3DSparkModel]

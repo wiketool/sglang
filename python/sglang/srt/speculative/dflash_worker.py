@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 from copy import deepcopy
@@ -98,6 +99,37 @@ class DFlashWorker:
         )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+
+        # Resolve the checkpoint layout before constructing TpModelWorker. The
+        # private draft runner must initialize attention metadata, warmup, and
+        # CUDA graphs with D, while the target worker and scheduler keep B.
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        early_draft_hf_config = get_config(
+            server_args.speculative_draft_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.speculative_draft_model_revision,
+            model_override_args=json.loads(server_args.json_model_override_args),
+        )
+        early_draft_config = parse_dflash_draft_config(
+            draft_hf_config=early_draft_hf_config
+        )
+        if server_args.speculative_num_draft_tokens is None:
+            external_block_size = early_draft_config.resolve_external_block_size(
+                default=16
+            )
+        else:
+            external_block_size = int(server_args.speculative_num_draft_tokens)
+        assert external_block_size is not None
+        self.block_size = early_draft_config.layout.validate_external_block_size(
+            int(external_block_size)
+        )
+        self.num_proposals = early_draft_config.layout.proposal_count(self.block_size)
+        self.draft_input_size = early_draft_config.resolve_draft_input_size(
+            self.block_size
+        )
+        self.dflash_layout = early_draft_config.layout
+        draft_server_args.speculative_num_draft_tokens = int(self.draft_input_size)
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton")
         if draft_backend is None:
@@ -161,22 +193,35 @@ class DFlashWorker:
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        if server_args.speculative_num_draft_tokens is None:
-            # Should not happen (ServerArgs should have inferred it), but keep a fallback.
-            self.block_size = int(draft_config.resolve_block_size(default=16))
-        else:
-            self.block_size = int(server_args.speculative_num_draft_tokens)
-            model_block_size = draft_config.block_size
-            if model_block_size is None:
-                model_block_size = getattr(self.draft_model, "block_size", None)
-            if model_block_size is not None and int(model_block_size) != int(
-                self.block_size
-            ):
-                logger.warning(
-                    "DFLASH block size mismatch: using speculative_num_draft_tokens=%s but draft config block_size=%s.",
-                    self.block_size,
-                    model_block_size,
-                )
+        if draft_config.layout != self.dflash_layout:
+            raise RuntimeError(
+                "DFLASH layout changed between early config parsing and model load: "
+                f"early={self.dflash_layout}, loaded={draft_config.layout}."
+            )
+        model_layout_name = getattr(self.draft_model, "dflash_layout_name", None)
+        if model_layout_name != self.dflash_layout.name:
+            raise RuntimeError(
+                "DFLASH model/layout capability mismatch: "
+                f"model={self.draft_model.__class__.__name__}, "
+                f"model_layout={model_layout_name!r}, "
+                f"config_layout={self.dflash_layout.name!r}."
+            )
+
+        model_draft_input_size = draft_config.block_size
+        if model_draft_input_size is None:
+            model_draft_input_size = getattr(self.draft_model, "block_size", None)
+        if model_draft_input_size is not None and int(model_draft_input_size) != int(
+            self.draft_input_size
+        ):
+            logger.warning(
+                "DFLASH draft input size differs from checkpoint training config: "
+                "using external B=%s / private D=%s with checkpoint block_size K=%s "
+                "for layout=%s.",
+                self.block_size,
+                self.draft_input_size,
+                model_draft_input_size,
+                self.dflash_layout.name,
+            )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -186,10 +231,13 @@ class DFlashWorker:
         )
         if self.tp_rank == 0:
             logger.info(
-                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
+                "Initialized DFLASH draft runner. attention_backend=%s, model=%s, layout=%s, external_block_size(B)=%s, draft_input_size(D)=%s, proposals(P)=%s, draft_window_size=%s, compact_cache=%s",
                 getattr(draft_server_args, "attention_backend", None),
                 self.draft_model.__class__.__name__,
+                self.dflash_layout.name,
                 self.block_size,
+                self.draft_input_size,
+                self.num_proposals,
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
@@ -200,22 +248,22 @@ class DFlashWorker:
                 self._mask_token_id_override,
             )
 
-        self._block_pos_offsets = torch.arange(
+        self._draft_pos_offsets = torch.arange(
+            self.draft_input_size, device=self.device, dtype=torch.int64
+        )
+        self._target_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
         )
-        self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
-        self._draft_block_positions_buf: Optional[torch.Tensor] = (
-            None  # [cap_bs, block_size]
-        )
-        self._draft_block_tokens_buf: Optional[torch.Tensor] = (
-            None  # [cap_bs, block_size]
-        )
+        self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, D]
+        self._draft_block_positions_buf: Optional[torch.Tensor] = None  # [cap_bs, D]
+        self._target_verify_positions_buf: Optional[torch.Tensor] = None  # [cap_bs, B]
+        self._candidate_tokens_buf: Optional[torch.Tensor] = None  # [cap_bs, B]
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = DFlashVerifyInput(
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
-            draft_token_num=int(self.block_size),
+            draft_token_num=int(self.draft_input_size),
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
@@ -322,14 +370,18 @@ class DFlashWorker:
 
         new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
         device = self.device
+        draft_input_size = int(self.draft_input_size)
         block_size = int(self.block_size)
         self._draft_block_ids_buf = torch.empty(
-            (new_cap, block_size), dtype=torch.long, device=device
+            (new_cap, draft_input_size), dtype=torch.long, device=device
         )
         self._draft_block_positions_buf = torch.empty(
+            (new_cap, draft_input_size), dtype=torch.int64, device=device
+        )
+        self._target_verify_positions_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
-        self._draft_block_tokens_buf = torch.empty(
+        self._candidate_tokens_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
         )
         self._draft_block_end_buf = torch.empty(
@@ -564,7 +616,8 @@ class DFlashWorker:
         self._ensure_draft_block_buffers(bs)
         assert self._draft_block_ids_buf is not None
         assert self._draft_block_positions_buf is not None
-        assert self._draft_block_tokens_buf is not None
+        assert self._target_verify_positions_buf is not None
+        assert self._candidate_tokens_buf is not None
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
@@ -587,13 +640,13 @@ class DFlashWorker:
 
         positions_2d = self._draft_block_positions_buf[:bs]
         torch.add(
-            target_prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d
+            target_prefix_lens.unsqueeze(1), self._draft_pos_offsets, out=positions_2d
         )
-        positions = positions_2d.reshape(-1)
+        draft_positions = positions_2d.reshape(-1)
 
         block_start = draft_prefix_lens
         block_end = self._draft_block_end_buf[:bs]
-        torch.add(block_start, int(self.block_size), out=block_end)
+        torch.add(block_start, int(self.draft_input_size), out=block_end)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
@@ -601,9 +654,9 @@ class DFlashWorker:
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
             if self.page_size == 1:
-                block_cache_loc = allocator.alloc(bs * self.block_size)
+                block_cache_loc = allocator.alloc(bs * self.draft_input_size)
             else:
-                block_end_cpu = seq_lens_cpu + int(self.block_size)
+                block_end_cpu = seq_lens_cpu + int(self.draft_input_size)
                 last_loc = get_last_loc(
                     self.draft_model_runner.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
@@ -615,11 +668,12 @@ class DFlashWorker:
                     block_end,
                     block_end_cpu,
                     last_loc,
-                    bs * self.block_size,
+                    bs * self.draft_input_size,
                 )
             if block_cache_loc is None:
                 raise RuntimeError(
-                    f"DFLASH draft OOM when allocating {bs * self.block_size} block tokens."
+                    "DFLASH draft OOM when allocating "
+                    f"{bs * self.draft_input_size} draft-input tokens."
                 )
 
             assign_req_to_token_pool_func(
@@ -646,7 +700,7 @@ class DFlashWorker:
                 out_cache_loc=block_cache_loc,
                 seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
-                positions=positions,
+                positions=draft_positions,
                 req_to_token_pool=self.draft_model_runner.req_to_token_pool,
                 token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
                 attn_backend=self.draft_model_runner.attn_backend,
@@ -667,19 +721,30 @@ class DFlashWorker:
         draft_hidden = draft_logits_output.hidden_states
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
-        draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+        draft_hidden = draft_hidden.view(bs, self.draft_input_size, -1)
+        proposal_hidden = self.dflash_layout.select_proposal_hidden(
+            draft_hidden,
+            external_block_size=self.block_size,
+        )
         draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+            hidden_states=proposal_hidden.reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
+        ).view(bs, self.num_proposals)
+        candidate_tokens = self._candidate_tokens_buf[:bs]
+        candidate_tokens[:, 0].copy_(block_ids[:, 0])
+        candidate_tokens[:, 1:].copy_(draft_next)
+
+        target_positions_2d = self._target_verify_positions_buf[:bs]
+        torch.add(
+            target_prefix_lens.unsqueeze(1),
+            self._target_pos_offsets,
+            out=target_positions_2d,
+        )
+        target_positions = target_positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
+            draft_token=candidate_tokens.reshape(-1),
+            positions=target_positions,
             draft_token_num=self.block_size,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
@@ -923,8 +988,8 @@ class DFlashWorker:
         if bs == 1:
             # Fast path for single request.
             max_ctx = int(total_ctx)
-            if max_ctx <= self._block_pos_offsets.numel():
-                r = self._block_pos_offsets[:max_ctx]
+            if max_ctx <= self._target_pos_offsets.numel():
+                r = self._target_pos_offsets[:max_ctx]
             else:
                 r = torch.arange(max_ctx, device=device, dtype=torch.int64)
             pos2d = ctx_start[:, None] + r[None, :]  # [1, ctx]
@@ -940,8 +1005,8 @@ class DFlashWorker:
             if max_ctx <= 0:
                 raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
 
-            if max_ctx <= self._block_pos_offsets.numel():
-                r = self._block_pos_offsets[:max_ctx]
+            if max_ctx <= self._target_pos_offsets.numel():
+                r = self._target_pos_offsets[:max_ctx]
             else:
                 r = torch.arange(max_ctx, device=device, dtype=torch.int64)
             r = r[None, :]  # [1, max_ctx]

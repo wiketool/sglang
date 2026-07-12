@@ -3384,39 +3384,50 @@ class ServerArgs:
                     )
                 self.speculative_dflash_draft_window_size = window_size
 
-            if self.speculative_num_draft_tokens is None:
-                from sglang.srt.speculative.dflash_utils import (
-                    parse_dflash_draft_config,
+            # Resolve the checkpoint layout even when B is explicit. DeepSpec's
+            # Qwen3DSpark checkpoint stores its native draft input length K, while
+            # SGLang's public DFlash value remains verify block size B.
+            from sglang.srt.speculative.dflash_utils import (
+                parse_dflash_draft_config,
+            )
+
+            parsed_dflash_config = None
+            try:
+                from sglang.srt.utils.hf_transformers_utils import get_config
+
+                draft_hf_config = get_config(
+                    self.speculative_draft_model_path,
+                    trust_remote_code=self.trust_remote_code,
+                    revision=self.speculative_draft_model_revision,
+                    model_override_args=json.loads(self.json_model_override_args),
+                )
+                parsed_dflash_config = parse_dflash_draft_config(
+                    draft_hf_config=draft_hf_config
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to parse DFLASH draft model config for block layout: %s",
+                    e,
                 )
 
-                model_override_args = json.loads(self.json_model_override_args)
-                inferred_block_size = None
-                try:
-                    from sglang.srt.utils.hf_transformers_utils import get_config
-
-                    draft_hf_config = get_config(
-                        self.speculative_draft_model_path,
-                        trust_remote_code=self.trust_remote_code,
-                        revision=self.speculative_draft_model_revision,
-                        model_override_args=model_override_args,
-                    )
-                    inferred_block_size = parse_dflash_draft_config(
-                        draft_hf_config=draft_hf_config
-                    ).resolve_block_size(default=None)
-                except Exception as e:
-                    logger.warning(
-                        "Failed to infer DFLASH block_size from draft model config; "
-                        "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                        e,
-                    )
-
+            if self.speculative_num_draft_tokens is None:
+                inferred_block_size = (
+                    parsed_dflash_config.resolve_external_block_size(default=None)
+                    if parsed_dflash_config is not None
+                    else None
+                )
                 if inferred_block_size is None:
                     inferred_block_size = 16
                     logger.warning(
-                        "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
+                        "speculative_num_draft_tokens is not set; defaulting external DFLASH block size B to %d.",
                         inferred_block_size,
                     )
-                self.speculative_num_draft_tokens = inferred_block_size
+                self.speculative_num_draft_tokens = int(inferred_block_size)
+
+            if parsed_dflash_config is not None:
+                parsed_dflash_config.layout.validate_external_block_size(
+                    int(self.speculative_num_draft_tokens)
+                )
 
             if window_size is not None:
                 draft_tokens = int(self.speculative_num_draft_tokens)

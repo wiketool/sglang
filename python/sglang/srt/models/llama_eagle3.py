@@ -40,6 +40,34 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 
 
+def expected_qwen3_eagle3_weight_names(num_hidden_layers: int) -> set[str]:
+    expected = {
+        "embed_tokens.weight",
+        "fc.weight",
+        "norm.weight",
+        "lm_head.weight",
+    }
+    for layer_id in range(int(num_hidden_layers)):
+        prefix = f"layers.{layer_id}"
+        expected.update(
+            {
+                f"{prefix}.hidden_norm.weight",
+                f"{prefix}.input_layernorm.weight",
+                f"{prefix}.post_attention_layernorm.weight",
+                f"{prefix}.self_attn.q_proj.weight",
+                f"{prefix}.self_attn.k_proj.weight",
+                f"{prefix}.self_attn.v_proj.weight",
+                f"{prefix}.self_attn.o_proj.weight",
+                f"{prefix}.self_attn.q_norm.weight",
+                f"{prefix}.self_attn.k_norm.weight",
+                f"{prefix}.mlp.gate_proj.weight",
+                f"{prefix}.mlp.up_proj.weight",
+                f"{prefix}.mlp.down_proj.weight",
+            }
+        )
+    return expected
+
+
 class LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
@@ -198,6 +226,9 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
+    eagle3_backbone_cls = LlamaModel
+    strict_weight_coverage = False
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -212,7 +243,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
 
-        self.model = LlamaModel(
+        self.model = self.eagle3_backbone_cls(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
@@ -221,20 +252,27 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            if config.draft_vocab_size is None:
+            draft_vocab_size = getattr(config, "draft_vocab_size", None)
+            if draft_vocab_size is None:
                 self.load_lm_head_from_target = True
                 config.draft_vocab_size = config.vocab_size
+                draft_vocab_size = config.vocab_size
             self.lm_head = ParallelLMHead(
-                config.draft_vocab_size,
+                draft_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
 
         config_ = copy.deepcopy(config)
+        # The draft logits processor has its own vocab size. Older checkpoints
+        # may omit draft_vocab_size when it is identical to the target vocab.
+        draft_logits_vocab_size = getattr(config_, "draft_vocab_size", None)
         config_.vocab_size = (
-            config_.draft_vocab_size
-        )  # draft logits processor has it's own vocab size
+            int(draft_logits_vocab_size)
+            if draft_logits_vocab_size is not None
+            else int(config_.vocab_size)
+        )
         self.logits_processor = LogitsProcessor(config_)
 
         self.capture_aux_hidden_states = True
@@ -242,6 +280,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
+        loaded_params = set()
+        consumed_checkpoint_weights = set()
+        unexpected_checkpoint_weights = set()
+
+        def canonical_checkpoint_name(name: str) -> str:
+            return name[len("model.") :] if name.startswith("model.") else name
+
         # Define the parameter mapping for stacked parameters
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -253,6 +298,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         ]
 
         for name, loaded_weight in weights:
+            checkpoint_name = name
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
@@ -272,6 +318,14 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(param_name)
+                    consumed_checkpoint_weights.add(
+                        canonical_checkpoint_name(checkpoint_name)
+                    )
+                else:
+                    unexpected_checkpoint_weights.add(
+                        canonical_checkpoint_name(checkpoint_name)
+                    )
                 break
             else:
                 # Handle regular parameters
@@ -282,6 +336,27 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    loaded_params.add(param_name)
+                    consumed_checkpoint_weights.add(
+                        canonical_checkpoint_name(checkpoint_name)
+                    )
+                else:
+                    unexpected_checkpoint_weights.add(
+                        canonical_checkpoint_name(checkpoint_name)
+                    )
+
+        if self.strict_weight_coverage:
+            expected_checkpoint_weights = expected_qwen3_eagle3_weight_names(
+                len(self.model.layers)
+            )
+            missing = expected_checkpoint_weights - consumed_checkpoint_weights
+            if missing or unexpected_checkpoint_weights:
+                raise ValueError(
+                    "Qwen3Eagle3Model checkpoint weight coverage failed: "
+                    f"missing_core={sorted(missing)}, "
+                    f"unexpected={sorted(unexpected_checkpoint_weights)}."
+                )
+        return loaded_params
 
     def get_hot_token_id(self):
         return self.hot_token_id

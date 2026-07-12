@@ -209,12 +209,12 @@ class EAGLEWorker(TpModelWorker):
         )
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
-            self.eagle_use_aux_hidden_state = True
-            eagle_config = getattr(
-                self.draft_model_runner.model_config.hf_config, "eagle_config", {}
+            from sglang.srt.speculative.eagle_config import (
+                resolve_eagle3_use_aux_hidden_state,
             )
-            self.eagle_use_aux_hidden_state = eagle_config.get(
-                "use_aux_hidden_state", True
+
+            self.eagle_use_aux_hidden_state = resolve_eagle3_use_aux_hidden_state(
+                self.draft_model_runner.model_config.hf_config
             )
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
@@ -1113,12 +1113,7 @@ class EAGLEWorker(TpModelWorker):
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
-            hidden_size = (
-                self.model_config.hidden_size * 3
-                if self.speculative_algorithm.is_eagle3()
-                and self.eagle_use_aux_hidden_state
-                else self.model_config.spec_hidden_size
-            )
+            hidden_size = self.model_config.eagle_aux_hidden_size
             batch.spec_info = EagleDraftInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,

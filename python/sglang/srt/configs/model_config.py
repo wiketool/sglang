@@ -316,7 +316,7 @@ class ModelConfig:
             if is_draft_model
             else server_args.decrypted_config_file
         )
-        return ModelConfig(
+        model_config = ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
@@ -337,6 +337,37 @@ class ModelConfig:
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             **kwargs,
         )
+        if (
+            not is_draft_model
+            and server_args.speculative_algorithm == "EAGLE3"
+            and server_args.speculative_draft_model_path is not None
+        ):
+            from sglang.srt.speculative.eagle_config import (
+                resolve_eagle3_aux_hidden_size,
+            )
+
+            draft_config_kwargs = {}
+            if (
+                server_args.decrypted_draft_config_file
+                and server_args.decrypted_draft_config_file.strip()
+            ):
+                draft_config_kwargs["_configuration_file"] = (
+                    server_args.decrypted_draft_config_file.strip()
+                )
+            draft_hf_config = get_config(
+                server_args.speculative_draft_model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.speculative_draft_model_revision,
+                model_override_args=json.loads(server_args.json_model_override_args),
+                **draft_config_kwargs,
+            )
+            eagle_aux_hidden_size = resolve_eagle3_aux_hidden_size(
+                draft_hf_config,
+                target_hidden_size=int(model_config.hidden_size),
+            )
+            model_config.spec_hidden_size = eagle_aux_hidden_size
+            model_config.eagle_aux_hidden_size = eagle_aux_hidden_size
+        return model_config
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
@@ -659,6 +690,33 @@ class ModelConfig:
         self.spec_hidden_size = (
             self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
         )
+        self.eagle_aux_hidden_size = self.spec_hidden_size
+        architectures = getattr(self.hf_config, "architectures", []) or []
+        if any(
+            arch in {"LlamaForCausalLMEagle3", "Qwen3Eagle3Model"}
+            for arch in architectures
+        ):
+            from sglang.srt.speculative.eagle_config import (
+                resolve_eagle3_aux_hidden_size,
+                resolve_eagle3_aux_layer_ids,
+            )
+
+            target_layer_ids = resolve_eagle3_aux_layer_ids(self.hf_config)
+            if "Qwen3Eagle3Model" in architectures and not target_layer_ids:
+                raise ValueError(
+                    "Qwen3Eagle3Model requires a non-empty target_layer_ids list."
+                )
+            target_hidden_size = int(
+                getattr(
+                    self.hf_text_config,
+                    "target_hidden_size",
+                    self.hidden_size,
+                )
+            )
+            self.eagle_aux_hidden_size = resolve_eagle3_aux_hidden_size(
+                self.hf_config,
+                target_hidden_size=target_hidden_size,
+            )
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:

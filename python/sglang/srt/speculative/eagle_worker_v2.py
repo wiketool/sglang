@@ -161,11 +161,12 @@ class EagleDraftWorker(BaseDraftWorker):
         self.draft_runner = self.draft_worker.model_runner
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
-            eagle_config = getattr(
-                self.draft_runner.model_config.hf_config, "eagle_config", {}
+            from sglang.srt.speculative.eagle_config import (
+                resolve_eagle3_use_aux_hidden_state,
             )
-            self.eagle_use_aux_hidden_state = eagle_config.get(
-                "use_aux_hidden_state", True
+
+            self.eagle_use_aux_hidden_state = resolve_eagle3_use_aux_hidden_state(
+                self.draft_runner.model_config.hf_config
             )
         self.init_token_map()
         self.init_lm_head()

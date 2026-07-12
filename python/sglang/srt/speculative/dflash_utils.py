@@ -12,6 +12,10 @@ from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
+DFLASH_SAME_POSITION_LAYOUT = "same_position"
+DFLASH_NEXT_TOKEN_LAYOUT = "next_token"
+DEEPSPEC_DFLASH_ARCHITECTURE = "Qwen3DSparkModel"
+
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
@@ -259,6 +263,121 @@ def _parse_optional_int(
 
 
 @dataclass(frozen=True)
+class DFlashLayout:
+    """Checkpoint-specific mapping between SGLang's verify block and draft IO."""
+
+    name: str
+    architecture: str
+    next_token_aligned: bool
+
+    def validate_external_block_size(self, external_block_size: int) -> int:
+        block_size = int(external_block_size)
+        min_size = 2 if self.next_token_aligned else 1
+        if block_size < min_size:
+            raise ValueError(
+                f"DFLASH layout {self.name!r} requires external block size "
+                f"B >= {min_size}, got B={block_size}."
+            )
+        return block_size
+
+    def proposal_count(self, external_block_size: int) -> int:
+        return self.validate_external_block_size(external_block_size) - 1
+
+    def draft_input_size(self, external_block_size: int) -> int:
+        block_size = self.validate_external_block_size(external_block_size)
+        return block_size - 1 if self.next_token_aligned else block_size
+
+    def external_block_size_from_config(
+        self,
+        checkpoint_block_size: Optional[int],
+        *,
+        default: Optional[int] = None,
+    ) -> Optional[int]:
+        if checkpoint_block_size is None:
+            return default
+        checkpoint_block_size = int(checkpoint_block_size)
+        external_block_size = (
+            checkpoint_block_size + 1
+            if self.next_token_aligned
+            else checkpoint_block_size
+        )
+        return self.validate_external_block_size(external_block_size)
+
+    def select_proposal_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        external_block_size: int,
+    ) -> torch.Tensor:
+        if hidden_states.ndim != 3:
+            raise ValueError(
+                "DFLASH draft hidden states must be shaped [batch, D, hidden], "
+                f"got shape={tuple(hidden_states.shape)}."
+            )
+        expected_draft_input_size = self.draft_input_size(external_block_size)
+        if int(hidden_states.shape[1]) != expected_draft_input_size:
+            raise ValueError(
+                "DFLASH draft hidden length mismatch for layout "
+                f"{self.name!r}: expected D={expected_draft_input_size} for "
+                f"external B={int(external_block_size)}, got "
+                f"shape={tuple(hidden_states.shape)}."
+            )
+
+        proposals = hidden_states if self.next_token_aligned else hidden_states[:, 1:]
+        expected_proposals = self.proposal_count(external_block_size)
+        if int(proposals.shape[1]) != expected_proposals:
+            raise RuntimeError(
+                "DFLASH proposal hidden length invariant failed: "
+                f"layout={self.name!r}, B={int(external_block_size)}, "
+                f"expected P={expected_proposals}, got {int(proposals.shape[1])}."
+            )
+        return proposals
+
+
+DFLASH_SAME_POSITION = DFlashLayout(
+    name=DFLASH_SAME_POSITION_LAYOUT,
+    architecture="DFlashDraftModel",
+    next_token_aligned=False,
+)
+DFLASH_NEXT_TOKEN = DFlashLayout(
+    name=DFLASH_NEXT_TOKEN_LAYOUT,
+    architecture=DEEPSPEC_DFLASH_ARCHITECTURE,
+    next_token_aligned=True,
+)
+
+
+def resolve_dflash_layout(draft_hf_config: Any) -> DFlashLayout:
+    architectures = _cfg_get(draft_hf_config, "architectures", None)
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if architectures and DEEPSPEC_DFLASH_ARCHITECTURE in architectures:
+        return DFLASH_NEXT_TOKEN
+    return DFLASH_SAME_POSITION
+
+
+def expected_dflash_core_weight_names(num_hidden_layers: int) -> set[str]:
+    expected = {"fc.weight", "hidden_norm.weight", "norm.weight"}
+    for layer_id in range(int(num_hidden_layers)):
+        prefix = f"layers.{layer_id}"
+        expected.update(
+            {
+                f"{prefix}.input_layernorm.weight",
+                f"{prefix}.post_attention_layernorm.weight",
+                f"{prefix}.self_attn.q_proj.weight",
+                f"{prefix}.self_attn.k_proj.weight",
+                f"{prefix}.self_attn.v_proj.weight",
+                f"{prefix}.self_attn.o_proj.weight",
+                f"{prefix}.self_attn.q_norm.weight",
+                f"{prefix}.self_attn.k_norm.weight",
+                f"{prefix}.mlp.gate_proj.weight",
+                f"{prefix}.mlp.up_proj.weight",
+                f"{prefix}.mlp.down_proj.weight",
+            }
+        )
+    return expected
+
+
+@dataclass(frozen=True)
 class DFlashDraftConfig:
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
@@ -266,6 +385,7 @@ class DFlashDraftConfig:
     target_layer_ids: Optional[List[int]]
     mask_token: str
     mask_token_id: Optional[int]
+    layout: DFlashLayout
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -276,7 +396,19 @@ class DFlashDraftConfig:
         return int(self.num_hidden_layers)
 
     def resolve_block_size(self, *, default: Optional[int] = None) -> Optional[int]:
+        """Return the checkpoint-native block size K (legacy API)."""
         return self.block_size if self.block_size is not None else default
+
+    def resolve_external_block_size(
+        self, *, default: Optional[int] = None
+    ) -> Optional[int]:
+        """Resolve SGLang's public verify block size B from checkpoint K."""
+        return self.layout.external_block_size_from_config(
+            self.block_size, default=default
+        )
+
+    def resolve_draft_input_size(self, external_block_size: int) -> int:
+        return self.layout.draft_input_size(external_block_size)
 
     def resolve_target_layer_ids(
         self,
@@ -371,6 +503,8 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         )
 
     mask_token_id = dflash_cfg.get("mask_token_id", None)
+    if mask_token_id is None:
+        mask_token_id = _cfg_get(draft_hf_config, "mask_token_id", None)
     if mask_token_id is not None:
         if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
             raise ValueError(
@@ -391,6 +525,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         target_layer_ids=parsed_target_layer_ids,
         mask_token=mask_token,
         mask_token_id=mask_token_id,
+        layout=resolve_dflash_layout(draft_hf_config),
     )
 
 

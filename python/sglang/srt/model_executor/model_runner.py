@@ -389,6 +389,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
+            from sglang.srt.speculative.eagle_config import (
+                resolve_eagle3_aux_hidden_size,
+                resolve_eagle3_aux_layer_ids,
+                resolve_eagle3_use_aux_hidden_state,
+            )
+
             # load draft config
             draft_model_config = self._build_model_config(
                 server_args,
@@ -396,22 +402,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_revision=server_args.speculative_draft_model_revision,
                 is_draft_model=True,
             )
-            self.eagle_use_aux_hidden_state = True
-
-            try:
-                # get the aux layer from draft model config
-                eagle_config = getattr(
-                    draft_model_config.hf_config, "eagle_config", None
-                )
-                self.eagle_use_aux_hidden_state = eagle_config.get(
-                    "use_aux_hidden_state", True
-                )
-                self.eagle_aux_hidden_state_layer_ids = eagle_config[
-                    "eagle_aux_hidden_state_layer_ids"
-                ]
-            except:
-                # if there is no aux layer, set to None
-                self.eagle_aux_hidden_state_layer_ids = None
+            self.eagle_use_aux_hidden_state = resolve_eagle3_use_aux_hidden_state(
+                draft_model_config.hf_config
+            )
+            self.eagle_aux_hidden_state_layer_ids = resolve_eagle3_aux_layer_ids(
+                draft_model_config.hf_config
+            )
+            eagle_aux_hidden_size = resolve_eagle3_aux_hidden_size(
+                draft_model_config.hf_config,
+                target_hidden_size=int(self.model_config.hidden_size),
+            )
+            self.model_config.spec_hidden_size = eagle_aux_hidden_size
+            self.model_config.eagle_aux_hidden_size = eagle_aux_hidden_size
 
         if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
