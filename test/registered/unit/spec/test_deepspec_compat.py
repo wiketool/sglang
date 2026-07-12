@@ -200,7 +200,7 @@ class TestOriginalDeepSpecCheckpoints(unittest.TestCase):
             self.assertEqual(parsed.mask_token_id, 151669)
             rope_theta, _ = get_rope_config(config)
             self.assertEqual(rope_theta, 1_000_000)
-            self.assertEqual(config.rope_theta, 10_000)
+            self.assertEqual(config.rope_parameters["rope_theta"], 1_000_000)
 
         expected_hidden_widths = (2560, 4096, 5120)
         expected_aux_widths = (12800, 20480, 25600)
