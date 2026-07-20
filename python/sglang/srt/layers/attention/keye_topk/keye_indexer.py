@@ -518,7 +518,7 @@ class KeyeIndexer(MultiPlatformOp):
 
         # Chunk to avoid OOM on large sequences
         bytes_per_row = k_offset * 4
-        max_rows = max(block_q, int((free_mem * 0.5) // max(bytes_per_row, 1)))
+        max_rows = max(block_q, int((free_mem * 0.25) // max(bytes_per_row, 1)))
         max_rows = (min(max_rows, padded_q_offset) // block_q) * block_q
         max_rows = max(max_rows, block_q)
 
